@@ -1136,6 +1136,49 @@ func TestToOpenAIChatRequest_PromptCacheOptions(t *testing.T) {
 	if fw == nil || fw.ChatParameters.PromptCacheOptions != nil {
 		t.Fatalf("expected prompt_cache_options stripped for Fireworks, got %#v", fw.ChatParameters.PromptCacheOptions)
 	}
+
+	// The gate is the model's, not the host's: any host serving gpt-5.6+ keeps the
+	// field, and earlier or non-OpenAI models drop it on every host. A custom provider
+	// (its own name, base type in ctx) follows the same rule.
+	for _, tc := range []struct {
+		provider schemas.ModelProvider
+		base     schemas.ModelProvider
+		model    string
+		keep     bool
+	}{
+		{schemas.OpenAI, "", "gpt-5-mini", false},
+		{schemas.OpenAI, "", "gpt-5.5", false},
+		{schemas.Azure, "", "gpt-4o", false},
+		{schemas.Azure, "", "gpt-6-luna", true},
+		{schemas.OpenRouter, "", "openai/gpt-5.6-luna", true},
+		{schemas.OpenRouter, "", "openai/gpt-4o-mini", false},
+		{schemas.BedrockMantle, "", "openai.gpt-5.6-luna", true},
+		{schemas.BedrockMantle, "", "openai.gpt-oss-120b", false},
+		{schemas.Bedrock, "", "openai.gpt-5.6-luna", true},
+		{schemas.Groq, "", "llama-3.3-70b-versatile", false},
+		{"my-openai", schemas.OpenAI, "gpt-5-mini", false},
+		{"my-openai", schemas.OpenAI, "gpt-5.6-luna", true},
+		{"my-azure", schemas.Azure, "gpt-5-mini", false},
+		{"my-groq", schemas.Groq, "llama-3.3-70b-versatile", false},
+	} {
+		reqCtx, reqCancel := schemas.NewBifrostContextWithCancel(nil)
+		if tc.base != "" {
+			reqCtx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+			reqCtx.SetValue(schemas.BifrostContextKeyBaseProviderType, tc.base)
+		}
+		req := mkReq(tc.provider, tc.model)
+		out := ToOpenAIChatRequest(reqCtx, req)
+		reqCancel()
+		if out == nil {
+			t.Fatalf("%s/%s: expected request", tc.provider, tc.model)
+		}
+		if got := out.ChatParameters.PromptCacheOptions != nil; got != tc.keep {
+			t.Errorf("%s/%s: prompt_cache_options present = %v, want %v", tc.provider, tc.model, got, tc.keep)
+		}
+		if req.Params.PromptCacheOptions == nil {
+			t.Errorf("%s/%s: caller params must not be mutated", tc.provider, tc.model)
+		}
+	}
 }
 
 func TestToOpenAIChatRequest_FireworksPreservesReasoningAndCacheIsolation(t *testing.T) {
@@ -2652,8 +2695,10 @@ func TestToOpenAIChatRequest_CacheBreakpointTTL(t *testing.T) {
 			require.False(t, gjson.Get(raw, "messages.1.content.0.prompt_cache_breakpoint.ttl").Exists(), "no ttl must be invented; raw=%s", raw)
 			require.NotNil(t, msgs[0].Content.ContentBlocks[0].PromptCacheBreakpoint.TTL, "caller input must not be mutated")
 			// Request-level ttl: Responses accepts "12h", Chat rejects it (live 400 "Supported values are: '30m'").
-			if tc.provider != schemas.OpenRouter { // OpenRouter never receives prompt_cache_options
-				require.Equal(t, "implicit", gjson.Get(raw, "prompt_cache_options.mode").String(), raw)
+			require.Equal(t, "implicit", gjson.Get(raw, "prompt_cache_options.mode").String(), raw)
+			if tc.provider == schemas.OpenRouter { // the ttl fix-up is OpenAI-family only; OpenRouter gets the caller's value
+				require.Equal(t, "12h", gjson.Get(raw, "prompt_cache_options.ttl").String(), raw)
+			} else {
 				require.False(t, gjson.Get(raw, "prompt_cache_options.ttl").Exists(), raw)
 			}
 			require.NotNil(t, opts.TTL, "caller params must not be mutated")
